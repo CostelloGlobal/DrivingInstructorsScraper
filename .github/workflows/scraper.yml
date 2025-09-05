@@ -1,9 +1,8 @@
 name: Run DVSA Scraper
 
 on:
-  workflow_dispatch:   # run manually
-  schedule:
-    - cron: "0 */12 * * *"   # runs every 12 hours
+  workflow_dispatch:   # allows you to run manually from Actions tab
+  push:                # runs automatically when you push code
 
 jobs:
   scrape:
