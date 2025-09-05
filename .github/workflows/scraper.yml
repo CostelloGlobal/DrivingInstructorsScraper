@@ -13,6 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # Make secrets available to EVERY step in this job
+    env:
+      SUPABASE_URL: ${{secrets.SUPABASE_URL}}
+      SUPABASE_KEY: ${{secrets.SUPABASE_KEY}}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -27,15 +32,11 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # Optional safety check (doesn't print secrets)
       - name: Check env is set (no secrets printed)
         run: |
           test -n "$SUPABASE_URL" && echo "SUPABASE_URL: set" || (echo "SUPABASE_URL missing" && exit 1)
           test -n "$SUPABASE_KEY" && echo "SUPABASE_KEY: set" || (echo "SUPABASE_KEY missing" && exit 1)
 
       - name: Run scraper
-        env:
-          SUPABASE_URL: ${{secrets.SUPABASE_URL}}
-          SUPABASE_KEY: ${{secrets.SUPABASE_KEY}}
         run: |
           python scraper.py
