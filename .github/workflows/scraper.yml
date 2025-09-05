@@ -13,7 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    # Make secrets available to EVERY step in this job
     env:
       SUPABASE_URL: ${{secrets.SUPABASE_URL}}
       SUPABASE_KEY: ${{secrets.SUPABASE_KEY}}
@@ -32,11 +31,22 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Check env is set (no secrets printed)
+      - name: Sanity check env (no secrets printed)
         run: |
           test -n "$SUPABASE_URL" && echo "SUPABASE_URL: set" || (echo "SUPABASE_URL missing" && exit 1)
           test -n "$SUPABASE_KEY" && echo "SUPABASE_KEY: set" || (echo "SUPABASE_KEY missing" && exit 1)
 
-      - name: Run scraper
+      - name: Ping Supabase REST
         run: |
-          python scraper.py
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            "$SUPABASE_URL/rest/v1/")
+          echo "REST root status: $code"
+          if [ "$code" -ge 400 ]; then
+            echo "Supabase REST not reachable with provided URL/key."
+            exit 1
+          fi
+
+      - name: Run scraper
+        run: python scraper.py
