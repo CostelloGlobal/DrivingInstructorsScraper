@@ -1,52 +1,188 @@
-name: Run DVSA Scraper
+import os
+import sys
+import time
+import json
+import datetime as dt
+from typing import List, Dict, Any, Optional
 
-on:
-  workflow_dispatch: {}
-  push:
-    branches: [ main ]
+import requests
+from bs4 import BeautifulSoup
+from supabase import create_client, Client
 
-permissions:
-  contents: read
 
-jobs:
-  scrape:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+# -----------------------------
+# 0) Configuration via ENV
+# -----------------------------
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-    env:
-      SUPABASE_URL: ${{secrets.SUPABASE_URL}}
-      SUPABASE_KEY: ${{secrets.SUPABASE_KEY}}
+# Table to insert/upsert into (create this in Supabase beforehand)
+TABLE_NAME = os.environ.get("TABLE_NAME", "instructors")
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+# TEST_MODE=1 (default) will fetch https://example.com and insert a demo row.
+# Set TEST_MODE=0 to run your real scraping logic (see section 4 below).
+TEST_MODE = os.environ.get("TEST_MODE", "1")  # "1" or "0"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+# Upsert conflict column (must exist on your table if you want idempotency)
+UPSERT_ON = os.environ.get("UPSERT_ON", "source_url")
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Sanity check env (no secrets printed)
-        run: |
-          test -n "$SUPABASE_URL" && echo "SUPABASE_URL: set" || (echo "SUPABASE_URL missing" && exit 1)
-          test -n "$SUPABASE_KEY" && echo "SUPABASE_KEY: set" || (echo "SUPABASE_KEY missing" && exit 1)
+# -----------------------------
+# 1) Utilities & Guards
+# -----------------------------
+def fail(msg: str, code: int = 1) -> None:
+    print(f"[ERROR] {msg}", file=sys.stderr)
+    sys.exit(code)
 
-      - name: Ping Supabase REST
-        run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "apikey: $SUPABASE_KEY" \
-            -H "Authorization: Bearer $SUPABASE_KEY" \
-            "$SUPABASE_URL/rest/v1/")
-          echo "REST root status: $code"
-          if [ "$code" -ge 400 ]; then
-            echo "Supabase REST not reachable with provided URL/key."
-            exit 1
-          fi
 
-      - name: Run scraper
-        run: python scraper.py
+def now_iso() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def http_get(url: str, timeout: int = 20, retries: int = 3) -> requests.Response:
+    """
+    Simple GET with retries.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(
+                url,
+                headers={"User-Agent": "DrivingInstructorsScraper/1.0"},
+                timeout=timeout,
+            )
+            if 200 <= resp.status_code < 400:
+                return resp
+            else:
+                print(f"[WARN] GET {url} -> HTTP {resp.status_code}. Attempt {attempt}/{retries}")
+        except Exception as e:
+            last_exc = e
+            print(f"[WARN] GET {url} failed: {e}. Attempt {attempt}/{retries}")
+        time.sleep(min(2 * attempt, 10))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Failed to GET {url} after {retries} attempts")
+
+
+# -----------------------------
+# 2) Supabase Setup
+# -----------------------------
+if not SUPABASE_URL:
+    fail("SUPABASE_URL is not set. Add a repo secret SUPABASE_URL with your Project URL (e.g. https://xxxx.supabase.co).")
+if not SUPABASE_KEY:
+    fail("SUPABASE_KEY is not set. Add a repo secret SUPABASE_KEY with your anon public key (NOT the service role).")
+
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    fail(f"Failed to create Supabase client. Check URL & anon key. Details: {e}")
+
+print("[OK] Supabase client created.")
+
+
+# -----------------------------
+# 3) Minimal parser (demo)
+# -----------------------------
+def parse_example_com(html: str, url: str) -> Dict[str, Any]:
+    """
+    Tiny parser that extracts the page title from example.com.
+    This is just to prove the pipeline. Replace for real pages in TEST_MODE=0.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    title = (soup.title.string or "").strip() if soup.title else ""
+    return {
+        "source_url": url,
+        "title": title,
+        "fetched_at": now_iso(),
+    }
+
+
+# -----------------------------
+# 4) Your real scraping logic
+# -----------------------------
+def scrape_real_sites() -> List[Dict[str, Any]]:
+    """
+    TODO: Replace with your real DVSA scraping.
+    Return a list[dict] where each dict maps to your Supabase table columns.
+    Example row keys should match your table schema (e.g. name, postcode, phone, source_url, etc.)
+    """
+    rows: List[Dict[str, Any]] = []
+
+    # EXAMPLE placeholder — add your own URLs and parsers here
+    urls = [
+        # "https://www.some-dvsa-page.example/...",
+    ]
+
+    for u in urls:
+        try:
+            r = http_get(u)
+            soup = BeautifulSoup(r.text, "html.parser")
+            # --- extract fields you need ---
+            # name = soup.select_one("h1").get_text(strip=True)
+            # phone = ...
+            # postcode = ...
+            # rows.append({
+            #     "name": name,
+            #     "phone": phone,
+            #     "postcode": postcode,
+            #     "source_url": u,
+            #     "fetched_at": now_iso(),
+            # })
+        except Exception as e:
+            print(f"[WARN] Failed to scrape {u}: {e}")
+
+    return rows
+
+
+# -----------------------------
+# 5) Supabase insert/upsert
+# -----------------------------
+def upsert_rows(table: str, rows: List[Dict[str, Any]], on_conflict: Optional[str] = None) -> None:
+    if not rows:
+        print("[INFO] No rows to upsert.")
+        return
+
+    print(f"[INFO] Upserting {len(rows)} row(s) into '{table}' ...")
+    try:
+        if on_conflict:
+            # supabase-py supports `upsert` with `on_conflict`
+            resp = supabase.table(table).upsert(rows, on_conflict=on_conflict).execute()
+        else:
+            resp = supabase.table(table).insert(rows).execute()
+    except Exception as e:
+        fail(f"Supabase upsert/insert failed: {e}")
+
+    # The library returns data or count depending on policies; we log a succinct message
+    print("[OK] Upsert/insert completed.")
+    if hasattr(resp, "data") and resp.data is not None:
+        try:
+            print(f"[DEBUG] First row returned: {json.dumps(resp.data[:1], ensure_ascii=False)}")
+        except Exception:
+            pass
+
+
+# -----------------------------
+# 6) Main
+# -----------------------------
+def main() -> None:
+    if TEST_MODE == "1":
+        # Prove the pipeline works by inserting a demo row from example.com
+        url = "https://example.com"
+        print(f"[INFO] TEST_MODE=1 → fetching {url}")
+        r = http_get(url)
+        row = parse_example_com(r.text, url)
+        upsert_rows(TABLE_NAME, [row], on_conflict=UPSERT_ON)
+        print("[DONE] Test row inserted. Set TEST_MODE=0 to run real scraping.")
+        return
+
+    # Real scraping path
+    rows = scrape_real_sites()
+    upsert_rows(TABLE_NAME, rows, on_conflict=UPSERT_ON)
+    print("[DONE] Real scraping run finished.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        fail(f"Unhandled error: {e}")
