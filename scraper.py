@@ -2,7 +2,7 @@ import os
 import sys
 import time
 import datetime as dt
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import requests
 from bs4 import BeautifulSoup
@@ -19,15 +19,10 @@ TABLE_NAME = os.environ.get("TABLE_NAME", "instructors")
 TEST_MODE = os.environ.get("TEST_MODE", "1")  # "1" = demo insert, "0" = real scraping
 UPSERT_ON = os.environ.get("UPSERT_ON", "source_url")
 
-# 🔴🔴🔴 IMPORTANT: Set this to the REAL search endpoint that accepts a postcode.
-# Example placeholder below — REPLACE with the DVSA / site URL you actually query.
-# It must contain "{pc}" where the postcode goes.
-SEARCH_URL_TEMPLATE = os.environ.get(
-    "SEARCH_URL_TEMPLATE",
-    "https://example.com/search?postcode={pc}"
-)
+# DVSA find-instructor page (postcode goes in {pc})
+SEARCH_URL_TEMPLATE = "https://finddrivinginstructor.dvsa.gov.uk/DSAFindNearestWebApp/findNearest.form?postcode={pc}&lang=en"
 
-# Postcodes to scrape when TEST_MODE="0"
+# Postcodes to try in TEST_MODE=0 (edit/expand as you like)
 POSTCODES = os.environ.get("POSTCODES", "E1,M1,B1").split(",")
 
 # polite delay between requests (seconds)
@@ -105,46 +100,25 @@ def build_url_for_postcode(pc: str) -> str:
     pc = pc.strip().replace(" ", "")
     return SEARCH_URL_TEMPLATE.format(pc=pc)
 
-# ---- Parsing helpers ----
 def extract_title(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     return (soup.title.string or "").strip() if soup.title else ""
 
 def extract_items(html: str, page_url: str) -> List[Dict[str, Any]]:
     """
-    This is where you'd parse the *actual* instructor cards on the results page.
-    To keep it compatible with your current Supabase schema, we only return
-    keys that exist in your table: source_url, title, fetched_at.
-
-    When you're ready to store richer fields (name/phone/postcode), add columns
-    in Supabase and extend the dicts below accordingly.
+    Minimal insert that matches your current table (source_url, title, fetched_at).
+    Once you decide on extra columns (name/phone/postcode), extend this.
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    results: List[Dict[str, Any]] = []
-
-    # --- Example strategies (uncomment & adapt for the real site) ---
-    # for card in soup.select(".instructor-card"):  # CSS selector for each result
-    #     name = card.select_one(".name").get_text(strip=True) if card.select_one(".name") else ""
-    #     title = name or extract_title(html)
-    #     link = card.select_one("a")
-    #     href = link["href"] if link and link.has_attr("href") else page_url
-    #     results.append({
-    #         "source_url": href if href.startswith("http") else page_url,
-    #         "title": title,
-    #         "fetched_at": now_iso(),
-    #     })
-
-    # Fallback: if we don't know the structure yet, insert one row with the page title.
-    # (This guarantees you see *something* land in Supabase while we tune selectors.)
-    title = extract_title(html)
-    results.append({
+    # TODO: Replace this with selectors once we pin down DVSA HTML structure.
+    # For now, insert one row per page so you can see data arriving.
+    title = extract_title(html) or "DVSA results page"
+    return [{
         "source_url": page_url,
-        "title": title or "Results page",
+        "title": title,
         "fetched_at": now_iso(),
-    })
-
-    return results
+    }]
 
 # =========================
 # 4) Modes
@@ -171,8 +145,7 @@ def run_real():
         r = SESSION.get(url, timeout=25)
 
         if r.status_code == 403:
-            print(f"[BLOCKED] 403 for {url} (site blocking this IP).")
-            # If this persists, use a self-hosted runner or a residential proxy.
+            print(f"[BLOCKED] 403 for {url} (site may block cloud IPs).")
             continue
         if r.status_code == 429:
             print("[RATE LIMIT] 429 — sleeping 30s then retrying once.")
