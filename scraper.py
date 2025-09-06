@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import json
 import datetime as dt
 from typing import List, Dict, Any, Optional
 
@@ -12,16 +11,30 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
 # =========================
-# 0) CONFIGURATION VIA ENV
+# 0) CONFIG (via env vars)
 # =========================
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 TABLE_NAME = os.environ.get("TABLE_NAME", "instructors")
-TEST_MODE = os.environ.get("TEST_MODE", "1")  # "1" = demo row, "0" = real scrape
+TEST_MODE = os.environ.get("TEST_MODE", "1")  # "1" = demo insert, "0" = real scraping
 UPSERT_ON = os.environ.get("UPSERT_ON", "source_url")
 
+# 🔴🔴🔴 IMPORTANT: Set this to the REAL search endpoint that accepts a postcode.
+# Example placeholder below — REPLACE with the DVSA / site URL you actually query.
+# It must contain "{pc}" where the postcode goes.
+SEARCH_URL_TEMPLATE = os.environ.get(
+    "SEARCH_URL_TEMPLATE",
+    "https://example.com/search?postcode={pc}"
+)
+
+# Postcodes to scrape when TEST_MODE="0"
+POSTCODES = os.environ.get("POSTCODES", "E1,M1,B1").split(",")
+
+# polite delay between requests (seconds)
+REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY", "1.0"))
+
 # =========================
-# Browser-like Session
+# 1) Browser-like Session
 # =========================
 BROWSER_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -54,7 +67,7 @@ def make_session() -> requests.Session:
 SESSION = make_session()
 
 # =========================
-# 1) UTILITIES
+# 2) Supabase client
 # =========================
 def fail(msg: str):
     print(f"[SETUP ERROR] {msg}", file=sys.stderr)
@@ -70,69 +83,118 @@ def supabase_client() -> Client:
     except Exception as e:
         fail(f"Failed to create Supabase client: {e}")
 
-SUPABASE = supabase_client()
+SB = supabase_client()
 
 def upsert_rows(rows: List[Dict[str, Any]]):
     if not rows:
         print("[INFO] No rows to insert")
         return
     try:
-        resp = SUPABASE.table(TABLE_NAME).upsert(rows, on_conflict=[UPSERT_ON]).execute()
+        SB.table(TABLE_NAME).upsert(rows, on_conflict=[UPSERT_ON]).execute()
         print(f"[INFO] Upserted {len(rows)} rows → {TABLE_NAME}")
     except Exception as e:
         print(f"[ERROR] Failed to upsert: {e}", file=sys.stderr)
 
 # =========================
-# 2) SCRAPING LOGIC
+# 3) Helpers
 # =========================
-def scrape_demo():
-    """Insert one demo row for TEST_MODE=1"""
+def now_iso() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def build_url_for_postcode(pc: str) -> str:
+    pc = pc.strip().replace(" ", "")
+    return SEARCH_URL_TEMPLATE.format(pc=pc)
+
+# ---- Parsing helpers ----
+def extract_title(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    return (soup.title.string or "").strip() if soup.title else ""
+
+def extract_items(html: str, page_url: str) -> List[Dict[str, Any]]:
+    """
+    This is where you'd parse the *actual* instructor cards on the results page.
+    To keep it compatible with your current Supabase schema, we only return
+    keys that exist in your table: source_url, title, fetched_at.
+
+    When you're ready to store richer fields (name/phone/postcode), add columns
+    in Supabase and extend the dicts below accordingly.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    results: List[Dict[str, Any]] = []
+
+    # --- Example strategies (uncomment & adapt for the real site) ---
+    # for card in soup.select(".instructor-card"):  # CSS selector for each result
+    #     name = card.select_one(".name").get_text(strip=True) if card.select_one(".name") else ""
+    #     title = name or extract_title(html)
+    #     link = card.select_one("a")
+    #     href = link["href"] if link and link.has_attr("href") else page_url
+    #     results.append({
+    #         "source_url": href if href.startswith("http") else page_url,
+    #         "title": title,
+    #         "fetched_at": now_iso(),
+    #     })
+
+    # Fallback: if we don't know the structure yet, insert one row with the page title.
+    # (This guarantees you see *something* land in Supabase while we tune selectors.)
+    title = extract_title(html)
+    results.append({
+        "source_url": page_url,
+        "title": title or "Results page",
+        "fetched_at": now_iso(),
+    })
+
+    return results
+
+# =========================
+# 4) Modes
+# =========================
+def run_demo():
     url = "https://example.com"
-    r = SESSION.get(url)
+    print(f"[INFO] TEST_MODE=1 → demo insert from {url}")
+    r = SESSION.get(url, timeout=25)
     if r.status_code != 200:
         print(f"[ERROR] Demo fetch failed: {r.status_code}")
         return
-    soup = BeautifulSoup(r.text, "html.parser")
-    title = soup.title.string if soup.title else "No title"
     row = {
         "source_url": url,
-        "title": title,
-        "fetched_at": dt.datetime.utcnow().isoformat()
+        "title": extract_title(r.text) or "Example Domain",
+        "fetched_at": now_iso(),
     }
     upsert_rows([row])
 
-def scrape_real():
-    """Your real scraping logic goes here"""
-    urls = [
-        # TODO: replace with your real DVSA or instructor URLs
-        "https://example.com/page1",
-        "https://example.com/page2"
-    ]
-    results = []
-    for url in urls:
-        r = SESSION.get(url)
+def run_real():
+    all_rows: List[Dict[str, Any]] = []
+    for pc in POSTCODES:
+        url = build_url_for_postcode(pc)
+        print(f"[INFO] Fetching {pc.strip()} → {url}")
+        r = SESSION.get(url, timeout=25)
+
         if r.status_code == 403:
-            print(f"[BLOCKED] 403 at {url}")
+            print(f"[BLOCKED] 403 for {url} (site blocking this IP).")
+            # If this persists, use a self-hosted runner or a residential proxy.
             continue
+        if r.status_code == 429:
+            print("[RATE LIMIT] 429 — sleeping 30s then retrying once.")
+            time.sleep(30)
+            r = SESSION.get(url, timeout=25)
+
         if not (200 <= r.status_code < 400):
-            print(f"[WARN] fetch {url} → {r.status_code}")
+            print(f"[WARN] HTTP {r.status_code} for {url}")
             continue
-        soup = BeautifulSoup(r.text, "html.parser")
-        title = soup.title.string if soup.title else "No title"
-        results.append({
-            "source_url": url,
-            "title": title,
-            "fetched_at": dt.datetime.utcnow().isoformat()
-        })
-        time.sleep(1.0)  # polite delay
-    upsert_rows(results)
+
+        rows = extract_items(r.text, url)
+        all_rows.extend(rows)
+        time.sleep(REQUEST_DELAY)
+
+    upsert_rows(all_rows)
 
 # =========================
-# 3) MAIN
+# 5) Entrypoint
 # =========================
 if __name__ == "__main__":
     print(f"[INFO] TEST_MODE={TEST_MODE}")
     if TEST_MODE == "1":
-        scrape_demo()
+        run_demo()
     else:
-        scrape_real()
+        run_real()
