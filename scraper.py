@@ -4,14 +4,15 @@ from supabase import create_client, Client
 import os
 import time
 
-# ✅ Supabase credentials from GitHub Secrets
+# ✅ Supabase credentials
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ✅ ScraperAPI key (already added to GitHub Secrets)
+# ✅ ScraperAPI key
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")
 
+# DVSA endpoint (we'll wrap this with ScraperAPI)
 BASE_URL = "https://finddrivinginstructor.dvsa.gov.uk/DSAFindNearestWebApp/findNearest.form"
 
 HEADERS = {
@@ -21,14 +22,12 @@ HEADERS = {
 
 def scrape_instructors(postcode="E1"):
     """Scrape DVSA instructor data for a given postcode via ScraperAPI"""
-    scraper_url = f"http://api.scraperapi.com"
+    scraper_url = "http://api.scraperapi.com"
     params = {
         "api_key": SCRAPER_API_KEY,
-        "url": BASE_URL,
-        "render": "false",
-        "keep_headers": "true",
+        "url": f"{BASE_URL}?postcode={postcode}",  # ✅ embed postcode directly
         "country_code": "gb",
-        "postcode": postcode
+        "render": "false"
     }
 
     try:
@@ -38,10 +37,14 @@ def scrape_instructors(postcode="E1"):
         print(f"❌ Failed to fetch {postcode}: {e}")
         return []
 
+    # ✅ Debug: show first 500 chars of the HTML
+    preview = response.text[:500].replace("\n", " ")
+    print(f"🔎 HTML preview for {postcode}: {preview}")
+
     soup = BeautifulSoup(response.text, "html.parser")
 
     instructors = []
-    for card in soup.select(".instructor-card"):  # ⚠️ Adjust selectors once we inspect actual HTML
+    for card in soup.select(".instructor-card"):  # ⚠️ Needs real DVSA HTML
         name = card.select_one(".name").get_text(strip=True) if card.select_one(".name") else None
         phone = card.select_one(".phone").get_text(strip=True) if card.select_one(".phone") else None
         website = card.select_one("a")["href"] if card.select_one("a") else None
@@ -55,6 +58,8 @@ def scrape_instructors(postcode="E1"):
             "email": None,
             "website": website
         })
+
+    print(f"✅ Found {len(instructors)} instructors for {postcode}")
     return instructors
 
 def save_to_supabase(records):
