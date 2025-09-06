@@ -16,7 +16,7 @@ jobs:
     env:
       SUPABASE_URL: ${{secrets.SUPABASE_URL}}
       SUPABASE_KEY: ${{secrets.SUPABASE_KEY}}
-      TEST_MODE: "1"   # "1" = demo row from example.com, "0" = real scraping
+      TEST_MODE: "0"   # "0" = demo row from example.com, "0" = real scraping
 
     steps:
       - name: Checkout repo
