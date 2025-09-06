@@ -1,65 +1,138 @@
+import os
+import sys
+import time
+import json
+import datetime as dt
+from typing import List, Dict, Any, Optional
+
 import requests
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
-import time
-import os
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
-# ✅ Get Supabase credentials from GitHub secrets (or fallback to env vars)
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://owjiihzdfmvktzltjyia.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your-anon-key-here")
+# =========================
+# 0) CONFIGURATION VIA ENV
+# =========================
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+TABLE_NAME = os.environ.get("TABLE_NAME", "instructors")
+TEST_MODE = os.environ.get("TEST_MODE", "1")  # "1" = demo row, "0" = real scrape
+UPSERT_ON = os.environ.get("UPSERT_ON", "source_url")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# =========================
+# Browser-like Session
+# =========================
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/126.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://www.google.com/",
+}
 
-# ✅ DVSA base URL (postcode based search)
-BASE_URL = "https://finddrivinginstructor.dvsa.gov.uk/DSAFindNearestWebApp/findNearest.form"
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=5, connect=5, read=5, status=5,
+        backoff_factor=1.2,
+        status_forcelist=[403,408,425,429,500,502,503,504],
+        allowed_methods=["GET","HEAD"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update(BROWSER_HEADERS)
+    return s
 
-def scrape_instructors(postcode="E1"):
-    """Scrape DVSA instructor data for a given postcode"""
-    params = {"postcode": postcode}
-    response = requests.get(BASE_URL, params=params)
+SESSION = make_session()
 
-    if response.status_code != 200:
-        print(f"❌ Failed to fetch {postcode}: {response.status_code}")
-        return []
+# =========================
+# 1) UTILITIES
+# =========================
+def fail(msg: str):
+    print(f"[SETUP ERROR] {msg}", file=sys.stderr)
+    sys.exit(1)
 
-    soup = BeautifulSoup(response.text, "html.parser")
+def supabase_client() -> Client:
+    if not SUPABASE_URL:
+        fail("SUPABASE_URL missing.")
+    if not SUPABASE_KEY:
+        fail("SUPABASE_KEY missing.")
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        fail(f"Failed to create Supabase client: {e}")
 
-    instructors = []
-    # ⚠️ Adjust selectors after inspecting DVSA HTML
-    for card in soup.select(".instructor-card"):
-        name = card.select_one(".name").get_text(strip=True) if card.select_one(".name") else None
-        phone = card.select_one(".phone").get_text(strip=True) if card.select_one(".phone") else None
-        website = card.select_one("a")["href"] if card.select_one("a") else None
+SUPABASE = supabase_client()
 
-        record = {
-            "name": name,
-            "postcode": postcode,
-            "dvsa_number": None,     # placeholder
-            "transmission": None,    # placeholder
-            "phone": phone,
-            "email": None,           # placeholder
-            "website": website
-        }
-        instructors.append(record)
-    return instructors
-
-def save_to_supabase(records):
-    if not records:
-        print("⚠️ No records to insert")
+def upsert_rows(rows: List[Dict[str, Any]]):
+    if not rows:
+        print("[INFO] No rows to insert")
         return
+    try:
+        resp = SUPABASE.table(TABLE_NAME).upsert(rows, on_conflict=[UPSERT_ON]).execute()
+        print(f"[INFO] Upserted {len(rows)} rows → {TABLE_NAME}")
+    except Exception as e:
+        print(f"[ERROR] Failed to upsert: {e}", file=sys.stderr)
 
-    for rec in records:
-        print(f"Scraped: {rec}")  # 👈 show in GitHub Actions log
+# =========================
+# 2) SCRAPING LOGIC
+# =========================
+def scrape_demo():
+    """Insert one demo row for TEST_MODE=1"""
+    url = "https://example.com"
+    r = SESSION.get(url)
+    if r.status_code != 200:
+        print(f"[ERROR] Demo fetch failed: {r.status_code}")
+        return
+    soup = BeautifulSoup(r.text, "html.parser")
+    title = soup.title.string if soup.title else "No title"
+    row = {
+        "source_url": url,
+        "title": title,
+        "fetched_at": dt.datetime.utcnow().isoformat()
+    }
+    upsert_rows([row])
 
-    supabase.table("driving_instructors").insert(records).execute()
-    print(f"✅ Inserted {len(records)} instructors into Supabase")
+def scrape_real():
+    """Your real scraping logic goes here"""
+    urls = [
+        # TODO: replace with your real DVSA or instructor URLs
+        "https://example.com/page1",
+        "https://example.com/page2"
+    ]
+    results = []
+    for url in urls:
+        r = SESSION.get(url)
+        if r.status_code == 403:
+            print(f"[BLOCKED] 403 at {url}")
+            continue
+        if not (200 <= r.status_code < 400):
+            print(f"[WARN] fetch {url} → {r.status_code}")
+            continue
+        soup = BeautifulSoup(r.text, "html.parser")
+        title = soup.title.string if soup.title else "No title"
+        results.append({
+            "source_url": url,
+            "title": title,
+            "fetched_at": dt.datetime.utcnow().isoformat()
+        })
+        time.sleep(1.0)  # polite delay
+    upsert_rows(results)
 
+# =========================
+# 3) MAIN
+# =========================
 if __name__ == "__main__":
-    # Example test set of postcodes
-    postcodes = ["E1", "M1", "B1"]
-
-    for pc in postcodes:
-        data = scrape_instructors(pc)
-        save_to_supabase(data)
-        print("⏳ Waiting 5 seconds before next postcode…")
-        time.sleep(5)   # polite delay
+    print(f"[INFO] TEST_MODE={TEST_MODE}")
+    if TEST_MODE == "1":
+        scrape_demo()
+    else:
+        scrape_real()
